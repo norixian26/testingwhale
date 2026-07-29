@@ -1,0 +1,649 @@
+--[[
+  Fully client‑side aim assist – drop‑in LocalScript
+  No require() needed. Runs immediately.
+  Supports mouse, keyboard, and controller (Left D‑Pad).
+  Displays a blue star on successful initialization.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================================
+-- CONFIGURATION (edit these to your liking)
+-- ============================================================
+local CONFIG = {
+    SMOOTHING_FACTOR = 0.25,
+    PREDICTION_WEIGHT = 0.7,
+    MAX_ANGLE_CORRECTION = 15,
+    PRIORITY_RADIUS = 100,
+    TARGET_UPDATE_RATE = 0.1,
+    AIM_ASSIST_ENABLED = true,
+
+    USE_MOUSE = true,
+    USE_GAMEPAD = true,
+
+    -- Controller bindings
+    CONTROLLER_AIM_KEY = Enum.KeyCode.DPadLeft,
+    CONTROLLER_ALT_AIM_KEY = Enum.KeyCode.ButtonR2,
+
+    -- Keyboard bindings
+    KEYBOARD_AIM_KEY = Enum.KeyCode.LeftShift,
+    KEYBOARD_ALT_AIM_KEY = Enum.KeyCode.LeftControl,
+
+    TOGGLE_MODE = false,
+    VISUAL_DEBUG = false,
+    IGNORE_TEAMMATES = true,
+    IGNORE_DEAD = true,
+
+    -- Controller‑specific
+    CONTROLLER_DEADZONE = 0.2,
+    CONTROLLER_SMOOTHING = 0.3,
+    USE_CONTROLLER_RUMBLE = true,
+    RUMBLE_DURATION = 0.15,
+}
+
+-- ============================================================
+-- INTERNAL STATE
+-- ============================================================
+local state = {
+    CurrentTarget = nil,
+    SmoothPosition = nil,
+    LastUpdateTime = 0,
+    IsAiming = false,
+    ControllerConnected = false,
+    LastRumbleTime = 0,
+    targets = {},
+    activeTargets = {},
+}
+
+local connections = {}
+local debugObjects = {}
+local gamepadRumble = nil
+
+-- ============================================================
+-- STARTUP BLUE STAR ANIMATION
+-- ============================================================
+local function showStartupIndicator()
+    -- Create a ScreenGui (attach to PlayerGui if available, otherwise CoreGui)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AimAssistStartupIndicator"
+    local parent = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+    if parent then
+        gui.Parent = parent
+    else
+        gui.Parent = game:GetService("CoreGui")
+    end
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 0, 0, 0)          -- start at zero
+    label.Position = UDim2.new(0.5, 0, 0.5, 0)  -- centered
+    label.AnchorPoint = Vector2.new(0.5, 0.5)
+    label.BackgroundTransparency = 1
+    label.Text = "★"
+    label.TextColor3 = Color3.new(0.2, 0.6, 1)   -- bright blue
+    label.TextScaled = true
+    label.Font = Enum.Font.SourceSansBold
+    label.Parent = gui
+
+    -- Animate: scale up to 200x200 over 0.5s
+    local tweenInfo1 = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tween1 = TweenService:Create(label, tweenInfo1, {
+        Size = UDim2.new(0, 200, 0, 200),
+        Position = UDim2.new(0.5, -100, 0.5, -100)
+    })
+    tween1:Play()
+    tween1.Completed:Wait()
+
+    -- Fade out over 1.5s
+    local tweenInfo2 = TweenInfo.new(1.5, Enum.EasingStyle.Linear)
+    local tween2 = TweenService:Create(label, tweenInfo2, {
+        TextTransparency = 1
+    })
+    tween2:Play()
+    tween2.Completed:Connect(function()
+        gui:Destroy()
+    end)
+end
+
+-- ============================================================
+-- CONTROLLER HELPERS
+-- ============================================================
+local function checkControllerConnected()
+    local gamepads = UserInputService:GetConnectedGamepads()
+    state.ControllerConnected = #gamepads > 0
+    return state.ControllerConnected
+end
+
+local function getGamepadRumble()
+    if not gamepadRumble then
+        local gamepads = UserInputService:GetConnectedGamepads()
+        if #gamepads > 0 then
+            gamepadRumble = UserInputService:GetGamepadRumble(gamepads[1])
+        end
+    end
+    return gamepadRumble
+end
+
+local function triggerRumble(intensity)
+    if not CONFIG.USE_CONTROLLER_RUMBLE then return end
+    if not state.ControllerConnected then return end
+    local rumble = getGamepadRumble()
+    if not rumble then return end
+    local now = tick()
+    if now - state.LastRumbleTime < CONFIG.RUMBLE_DURATION then return end
+    intensity = intensity or 0.5
+    rumble:Start(intensity, intensity, CONFIG.RUMBLE_DURATION)
+    state.LastRumbleTime = now
+    task.delay(CONFIG.RUMBLE_DURATION, function()
+        if rumble then rumble:Stop() end
+    end)
+end
+
+local function getControllerAimVector()
+    if not state.ControllerConnected then return nil end
+    local gamepads = UserInputService:GetConnectedGamepads()
+    if #gamepads == 0 then return nil end
+    local thumb = UserInputService:GetGamepadThumbstick(Enum.UserInputType.GamepadLeftThumbstick, gamepads[1])
+    local mag = thumb.Magnitude
+    if mag < CONFIG.CONTROLLER_DEADZONE then
+        return Vector2.zero
+    end
+    local norm = (thumb - (thumb.Unit * CONFIG.CONTROLLER_DEADZONE)) / (1 - CONFIG.CONTROLLER_DEADZONE)
+    return norm
+end
+
+-- ============================================================
+-- TARGET ACQUISITION
+-- ============================================================
+local function getAllCharacters()
+    local chars = {}
+    for _, player in Players:GetPlayers() do
+        if player == LocalPlayer then continue end
+        local char = player.Character
+        if not char then continue end
+        local hum = char:FindFirstChild("Humanoid")
+        if not hum then continue end
+        if CONFIG.IGNORE_DEAD and hum.Health <= 0 then continue end
+        if CONFIG.IGNORE_TEAMMATES then
+            local localTeam = LocalPlayer.Team
+            if localTeam and player.Team == localTeam then continue end
+        end
+        table.insert(chars, char)
+    end
+    return chars
+end
+
+local function updateTargetEntity(character)
+    local humanoid = character:FindFirstChild("Humanoid")
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not rootPart then return nil end
+    if humanoid.Health <= 0 then return nil end
+    local player = Players:GetPlayerFromCharacter(character)
+    if not player then return nil end
+    local userId = player.UserId
+    local existing = state.targets[userId]
+    if existing then
+        existing.RootPart = rootPart
+        existing.Humanoid = humanoid
+        existing.IsValid = true
+        existing.LastSeen = tick()
+        return existing
+    end
+    local newTarget = {
+        Character = character,
+        Humanoid = humanoid,
+        RootPart = rootPart,
+        LastPosition = rootPart.Position,
+        Velocity = Vector3.zero,
+        Priority = 1.0,
+        IsValid = true,
+        Team = player.Team and player.Team.Name or nil,
+        LastSeen = tick(),
+    }
+    state.targets[userId] = newTarget
+    return newTarget
+end
+
+local function scanTargets()
+    local chars = getAllCharacters()
+    local foundIds = {}
+    for _, char in chars do
+        local player = Players:GetPlayerFromCharacter(char)
+        if not player then continue end
+        local t = updateTargetEntity(char)
+        if t then table.insert(foundIds, player.UserId) end
+    end
+    for id, t in state.targets do
+        if not table.find(foundIds, id) then
+            t.IsValid = false
+        end
+    end
+    state.activeTargets = {}
+    for _, t in state.targets do
+        if t.IsValid and t.RootPart then
+            table.insert(state.activeTargets, t)
+        end
+    end
+end
+
+local function updateTargetVelocity(target, dt)
+    if not target.RootPart then return end
+    local cur = target.RootPart.Position
+    if target.LastPosition and dt > 0 then
+        target.Velocity = (cur - target.LastPosition) / dt
+    end
+    target.LastPosition = cur
+end
+
+-- ============================================================
+-- PRIORITY & SELECTION
+-- ============================================================
+local function calculatePriority(target, origin)
+    if not target.RootPart then return 0 end
+    local dist = (target.RootPart.Position - origin).Magnitude
+    if dist > CONFIG.PRIORITY_RADIUS then return 0 end
+    local healthFactor = 1 - (target.Humanoid.Health / target.Humanoid.MaxHealth)
+    local distanceFactor = 1 - (dist / CONFIG.PRIORITY_RADIUS)
+    local speed = target.Velocity.Magnitude
+    local movementFactor = math.min(1, speed / 30)
+    local visibilityFactor = 1.0
+    local camera = workspace.CurrentCamera
+    if camera and target.RootPart then
+        local vp = camera:WorldToViewportPoint(target.RootPart.Position)
+        visibilityFactor = (vp.Z > 0 and 1) or 0.5
+    end
+    return (healthFactor * 0.35) + (distanceFactor * 0.3) + (movementFactor * 0.2) + (visibilityFactor * 0.15)
+end
+
+local function getBestTarget(origin, aimDirection)
+    local best = nil
+    local bestScore = -math.huge
+    local controllerAim = getControllerAimVector()
+    local hasControllerInput = controllerAim and controllerAim.Magnitude > 0
+
+    for _, target in state.activeTargets do
+        if not target.IsValid or not target.RootPart then continue end
+        local tPos = target.RootPart.Position
+        local toTarget = (tPos - origin).Unit
+        local dot = aimDirection:Dot(toTarget)
+        local angle = math.acos(math.clamp(dot, -1, 1))
+        if angle > math.rad(CONFIG.MAX_ANGLE_CORRECTION) then continue end
+
+        local controllerBonus = 1.0
+        if hasControllerInput and state.ControllerConnected then
+            local camera = workspace.CurrentCamera
+            if camera then
+                local sp, onScreen = camera:WorldToViewportPoint(tPos)
+                if onScreen then
+                    local center = camera.ViewportSize / 2
+                    local offset = Vector2.new(sp.X, sp.Y) - center
+                    local stick = controllerAim or Vector2.zero
+                    local aimDir2D = Vector2.new(stick.X, -stick.Y) * 100
+                    local dist2D = (offset - aimDir2D).Magnitude
+                    controllerBonus = math.max(0, 1 - (dist2D / 300))
+                end
+            end
+        end
+
+        local priority = calculatePriority(target, origin)
+        local angleWeight = 1 - (angle / math.rad(CONFIG.MAX_ANGLE_CORRECTION))
+        local score = angleWeight * priority * (0.8 + 0.2 * controllerBonus)
+        if score > bestScore then
+            bestScore = score
+            best = target
+        end
+    end
+    return best
+end
+
+-- ============================================================
+-- PREDICTION & AIM
+-- ============================================================
+local function predictPosition(target, currentPos, dt)
+    local predicted = currentPos + (target.Velocity * CONFIG.PREDICTION_WEIGHT * dt * 2)
+    if target.Velocity.Y > 5 then
+        predicted = predicted + Vector3.new(0, target.Velocity.Y * dt * 0.5, 0)
+    end
+    local maxPred = 50
+    local offset = predicted - currentPos
+    if offset.Magnitude > maxPred then
+        predicted = currentPos + offset.Unit * maxPred
+    end
+    return predicted
+end
+
+local function applyAimAssist(targetPos)
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local origin = camera.CFrame.Position
+    local dir = (targetPos - origin).Unit
+    local targetCF = CFrame.lookAt(origin, origin + dir)
+    local smoothing = state.ControllerConnected and CONFIG.CONTROLLER_SMOOTHING or CONFIG.SMOOTHING_FACTOR
+    if state.SmoothPosition then
+        local smoothed = state.SmoothPosition:Lerp(targetPos, smoothing)
+        state.SmoothPosition = smoothed
+        local smoothedDir = (smoothed - origin).Unit
+        targetCF = CFrame.lookAt(origin, origin + smoothedDir)
+    else
+        state.SmoothPosition = targetPos
+    end
+    local curLook = camera.CFrame.LookVector
+    local tgtLook = targetCF.LookVector
+    local angle = math.acos(math.clamp(curLook:Dot(tgtLook), -1, 1))
+    if angle <= math.rad(CONFIG.MAX_ANGLE_CORRECTION) then
+        camera.CFrame = targetCF
+        if state.ControllerConnected and state.CurrentTarget then
+            triggerRumble(0.3)
+        end
+    end
+end
+
+-- ============================================================
+-- DEBUG VISUALS
+-- ============================================================
+local function updateDebugVisuals()
+    if not CONFIG.VISUAL_DEBUG then
+        for _, obj in debugObjects do
+            if obj and obj.Parent then obj:Destroy() end
+        end
+        debugObjects = {}
+        return
+    end
+    -- clean old
+    for _, obj in debugObjects do
+        if obj and obj.Parent then obj:Destroy() end
+    end
+    debugObjects = {}
+
+    local target = state.CurrentTarget
+    if target and target.RootPart then
+        local ind = Instance.new("Part")
+        ind.Size = Vector3.new(2,2,2)
+        ind.BrickColor = BrickColor.new("Bright red")
+        ind.Material = Enum.Material.Neon
+        ind.Anchored = true
+        ind.CanCollide = false
+        ind.Parent = workspace
+        ind.Position = target.RootPart.Position + Vector3.new(0,4,0)
+        local bill = Instance.new("BillboardGui")
+        bill.Size = UDim2.new(0,100,0,30)
+        bill.Adornee = ind
+        bill.Parent = ind
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1,0,1,0)
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.new(1,0,0)
+        label.TextScaled = true
+        label.Text = state.ControllerConnected and "🎮 TARGET" or "🎯 TARGET"
+        label.Parent = bill
+        table.insert(debugObjects, ind)
+    end
+
+    for _, t in state.activeTargets do
+        if t == state.CurrentTarget then continue end
+        if not t.RootPart then continue end
+        local ind = Instance.new("Part")
+        ind.Size = Vector3.new(1,1,1)
+        ind.BrickColor = BrickColor.new("Bright yellow")
+        ind.Material = Enum.Material.Neon
+        ind.Anchored = true
+        ind.CanCollide = false
+        ind.Parent = workspace
+        ind.Position = t.RootPart.Position + Vector3.new(0,3,0)
+        table.insert(debugObjects, ind)
+    end
+
+    if state.ControllerConnected then
+        local status = Instance.new("Part")
+        status.Size = Vector3.new(1,1,1)
+        status.BrickColor = BrickColor.new("Bright green")
+        status.Material = Enum.Material.Neon
+        status.Anchored = true
+        status.CanCollide = false
+        status.Parent = workspace
+        status.Position = Vector3.new(0,10,0)
+        local bill = Instance.new("BillboardGui")
+        bill.Size = UDim2.new(0,50,0,20)
+        bill.Adornee = status
+        bill.Parent = status
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1,0,1,0)
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.new(0,1,0)
+        label.TextScaled = true
+        label.Text = "🎮 Connected"
+        label.Parent = bill
+        table.insert(debugObjects, status)
+    end
+end
+
+-- ============================================================
+-- MAIN LOOP
+-- ============================================================
+local function onHeartbeat(dt)
+    if not CONFIG.AIM_ASSIST_ENABLED then return end
+    if not LocalPlayer or not LocalPlayer.Character then return end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+
+    if tick() - state.LastUpdateTime % 2 < dt then
+        checkControllerConnected()
+    end
+
+    if tick() - state.LastUpdateTime > CONFIG.TARGET_UPDATE_RATE then
+        scanTargets()
+        state.LastUpdateTime = tick()
+    end
+
+    for _, t in state.activeTargets do
+        updateTargetVelocity(t, dt)
+    end
+
+    local origin = camera.CFrame.Position
+    local aimDir = camera.CFrame.LookVector
+    local best = getBestTarget(origin, aimDir)
+    state.CurrentTarget = best
+
+    if best and state.IsAiming then
+        local curPos = best.RootPart.Position
+        local pred = predictPosition(best, curPos, dt)
+        local humanize = state.ControllerConnected and 0.3 or 0.5
+        local off = Vector3.new(
+            (math.random() - 0.5) * humanize,
+            (math.random() - 0.5) * humanize,
+            (math.random() - 0.5) * humanize
+        )
+        pred = pred + off
+        applyAimAssist(pred)
+    end
+
+    updateDebugVisuals()
+end
+
+-- ============================================================
+-- INPUT HANDLING
+-- ============================================================
+local function onInputBegan(input, gameProcessed)
+    if gameProcessed then return end
+
+    if CONFIG.USE_MOUSE and input.UserInputType == Enum.UserInputType.MouseButton2 then
+        state.IsAiming = true
+    end
+
+    if CONFIG.USE_GAMEPAD and input.UserInputType == Enum.UserInputType.GamepadButton2 then
+        state.IsAiming = true
+        checkControllerConnected()
+    end
+
+    if CONFIG.USE_GAMEPAD and input.KeyCode == CONFIG.CONTROLLER_AIM_KEY then
+        if CONFIG.TOGGLE_MODE then
+            state.IsAiming = not state.IsAiming
+            if state.IsAiming then triggerRumble(0.5) end
+        else
+            state.IsAiming = true
+            triggerRumble(0.2)
+        end
+        checkControllerConnected()
+    end
+
+    if CONFIG.USE_GAMEPAD and input.KeyCode == CONFIG.CONTROLLER_ALT_AIM_KEY then
+        state.IsAiming = true
+        checkControllerConnected()
+    end
+
+    if input.KeyCode == CONFIG.KEYBOARD_AIM_KEY then
+        if CONFIG.TOGGLE_MODE then
+            state.IsAiming = not state.IsAiming
+        else
+            state.IsAiming = true
+        end
+    end
+
+    if input.KeyCode == CONFIG.KEYBOARD_ALT_AIM_KEY then
+        state.IsAiming = true
+    end
+
+    if input.UserInputType == Enum.UserInputType.GamepadConnection then
+        checkControllerConnected()
+        triggerRumble(0.3)
+    end
+end
+
+local function onInputEnded(input, gameProcessed)
+    if gameProcessed then return end
+
+    if CONFIG.USE_MOUSE and input.UserInputType == Enum.UserInputType.MouseButton2 then
+        if not CONFIG.TOGGLE_MODE then state.IsAiming = false end
+    end
+
+    if CONFIG.USE_GAMEPAD and input.UserInputType == Enum.UserInputType.GamepadButton2 then
+        if not CONFIG.TOGGLE_MODE then state.IsAiming = false end
+    end
+
+    if CONFIG.USE_GAMEPAD and input.KeyCode == CONFIG.CONTROLLER_AIM_KEY then
+        if not CONFIG.TOGGLE_MODE then state.IsAiming = false end
+    end
+
+    if CONFIG.USE_GAMEPAD and input.KeyCode == CONFIG.CONTROLLER_ALT_AIM_KEY then
+        if not CONFIG.TOGGLE_MODE then state.IsAiming = false end
+    end
+
+    if input.KeyCode == CONFIG.KEYBOARD_AIM_KEY and not CONFIG.TOGGLE_MODE then
+        state.IsAiming = false
+    end
+
+    if input.KeyCode == CONFIG.KEYBOARD_ALT_AIM_KEY and not CONFIG.TOGGLE_MODE then
+        state.IsAiming = false
+    end
+
+    if input.UserInputType == Enum.UserInputType.GamepadDisconnection then
+        state.ControllerConnected = false
+        gamepadRumble = nil
+    end
+end
+
+-- ============================================================
+-- CHARACTER TRACKING
+-- ============================================================
+local function onCharacterAdded(char)
+    local player = Players:GetPlayerFromCharacter(char)
+    if player and player ~= LocalPlayer then
+        updateTargetEntity(char)
+    end
+end
+
+local function onCharacterRemoved(char)
+    local player = Players:GetPlayerFromCharacter(char)
+    if player then
+        state.targets[player.UserId] = nil
+    end
+end
+
+-- ============================================================
+-- INITIALIZATION & CLEANUP
+-- ============================================================
+local function setup()
+    -- disconnect any previous connections (if script re-runs)
+    for _, conn in connections do
+        if conn and conn.Disconnect then conn:Disconnect() end
+    end
+    connections = {}
+    for _, obj in debugObjects do
+        if obj and obj.Parent then obj:Destroy() end
+    end
+    debugObjects = {}
+    state.targets = {}
+    state.activeTargets = {}
+
+    checkControllerConnected()
+    scanTargets()
+    state.LastUpdateTime = tick()
+
+    connections.Heartbeat = RunService.Heartbeat:Connect(onHeartbeat)
+    connections.InputBegan = UserInputService.InputBegan:Connect(onInputBegan)
+    connections.InputEnded = UserInputService.InputEnded:Connect(onInputEnded)
+
+    connections.PlayerAdded = Players.PlayerAdded:Connect(function(player)
+        if player ~= LocalPlayer then
+            player.CharacterAdded:Connect(onCharacterAdded)
+            if player.Character then onCharacterAdded(player.Character) end
+        end
+    end)
+
+    connections.PlayerRemoved = Players.PlayerRemoved:Connect(function(player)
+        onCharacterRemoved(player.Character)
+    end)
+
+    connections.GamepadConnected = UserInputService.GamepadConnected:Connect(function()
+        checkControllerConnected()
+        triggerRumble(0.3)
+    end)
+
+    connections.GamepadDisconnected = UserInputService.GamepadDisconnected:Connect(function()
+        state.ControllerConnected = false
+        gamepadRumble = nil
+    end)
+
+    print("✅ Aim Assist initialized. Controller: ", state.ControllerConnected and "Connected" or "Not connected")
+end
+
+-- ============================================================
+-- EXTERNAL API (optional, if you need to control it from outside)
+-- ============================================================
+_G.AimAssist = {
+    Enable = function() CONFIG.AIM_ASSIST_ENABLED = true end,
+    Disable = function() CONFIG.AIM_ASSIST_ENABLED = false state.IsAiming = false end,
+    Toggle = function()
+        CONFIG.AIM_ASSIST_ENABLED = not CONFIG.AIM_ASSIST_ENABLED
+        if not CONFIG.AIM_ASSIST_ENABLED then state.IsAiming = false end
+        return CONFIG.AIM_ASSIST_ENABLED
+    end,
+    SetConfig = function(key, val)
+        if CONFIG[key] ~= nil then CONFIG[key] = val return true end
+        return false
+    end,
+    GetCurrentTarget = function() return state.CurrentTarget end,
+    IsAiming = function() return state.IsAiming end,
+    IsEnabled = function() return CONFIG.AIM_ASSIST_ENABLED end,
+    IsControllerConnected = function() return state.ControllerConnected end,
+    TriggerRumble = triggerRumble,
+}
+
+-- ============================================================
+-- START THE SYSTEM
+-- ============================================================
+setup()
+
+-- Show the blue star indicator when the script runs successfully
+showStartupIndicator()
+
+-- If the player respawns, keep running – but reset target tracking
+LocalPlayer.CharacterAdded:Connect(function()
+    state.targets = {}
+    state.activeTargets = {}
+end)
+
+print("🎯 Aim Assist LocalScript is running! Press Left Shift / Left D‑Pad to aim.")
