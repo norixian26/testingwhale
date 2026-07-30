@@ -1,0 +1,243 @@
+-- Delta Executor: Horizontal-Only 180° Flick (tap / R2) – Toggleable + Cooldown Switch
+-- Cooldown switch: choose 1s or 2s, fancy rounded UI.
+
+local player = game.Players.LocalPlayer
+local uis = game:GetService("UserInputService")
+local runService = game:GetService("RunService")
+local cam = workspace.CurrentCamera
+
+-- State
+local flickEnabled = false
+local isFlicking = false
+local flickConn = nil
+local cooldownEnd = 0
+local cooldownActive = false
+local cooldownDuration = 1   -- default 1 second, switch toggles to 2
+
+-- GUI elements
+local gui = Instance.new("ScreenGui")
+gui.Parent = player:WaitForChild("PlayerGui")
+gui.ResetOnSpawn = false
+
+-- Main panel (draggable, rounded corners)
+local panel = Instance.new("Frame")
+panel.Size = UDim2.new(0, 140, 0, 110)   -- wider & taller for switch
+panel.Position = UDim2.new(1, -150, 0, 50)
+panel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Draggable = true   -- whole panel is draggable
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
+
+-- Drag handle (a small bar at the top)
+local dragHandle = Instance.new("Frame", panel)
+dragHandle.Size = UDim2.new(1, -20, 0, 12)
+dragHandle.Position = UDim2.new(0, 10, 0, 4)
+dragHandle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+dragHandle.BackgroundTransparency = 0.7
+dragHandle.BorderSizePixel = 0
+Instance.new("UICorner", dragHandle).CornerRadius = UDim.new(0, 4)
+
+-- Flick toggle button (fancy rounded)
+local toggleBtn = Instance.new("TextButton", panel)
+toggleBtn.Size = UDim2.new(1, -20, 0, 36)
+toggleBtn.Position = UDim2.new(0, 10, 0, 20)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+toggleBtn.Text = "Flick: OFF"
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font = Enum.Font.SourceSansBold
+toggleBtn.TextSize = 14
+toggleBtn.BorderSizePixel = 0
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 10)
+
+-- Cooldown switch section
+local switchLabel = Instance.new("TextLabel", panel)
+switchLabel.Size = UDim2.new(1, -20, 0, 16)
+switchLabel.Position = UDim2.new(0, 10, 0, 60)
+switchLabel.BackgroundTransparency = 1
+switchLabel.Text = "Cooldown"
+switchLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+switchLabel.Font = Enum.Font.SourceSans
+switchLabel.TextSize = 12
+
+-- Switch background
+local switchBg = Instance.new("Frame", panel)
+switchBg.Size = UDim2.new(0, 50, 0, 20)
+switchBg.Position = UDim2.new(0, 10, 0, 76)
+switchBg.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+switchBg.BorderSizePixel = 0
+Instance.new("UICorner", switchBg).CornerRadius = UDim.new(0, 10)
+
+-- Active indicator (moves left/right)
+local switchIndicator = Instance.new("Frame", switchBg)
+switchIndicator.Size = UDim2.new(0.5, 0, 1, 0)
+switchIndicator.Position = UDim2.new(0, 0, 0, 0)  -- will move
+switchIndicator.BackgroundColor3 = Color3.fromRGB(0, 180, 100)
+switchIndicator.BorderSizePixel = 0
+Instance.new("UICorner", switchIndicator).CornerRadius = UDim.new(0, 10)
+
+-- "1s" and "2s" text labels
+local oneLabel = Instance.new("TextLabel", switchBg)
+oneLabel.Size = UDim2.new(0.5, 0, 1, 0)
+oneLabel.Position = UDim2.new(0, 0, 0, 0)
+oneLabel.BackgroundTransparency = 1
+oneLabel.Text = "1s"
+oneLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+oneLabel.Font = Enum.Font.SourceSansBold
+oneLabel.TextSize = 12
+oneLabel.ZIndex = 2
+
+local twoLabel = Instance.new("TextLabel", switchBg)
+twoLabel.Size = UDim2.new(0.5, 0, 1, 0)
+twoLabel.Position = UDim2.new(0.5, 0, 0, 0)
+twoLabel.BackgroundTransparency = 1
+twoLabel.Text = "2s"
+twoLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+twoLabel.Font = Enum.Font.SourceSansBold
+twoLabel.TextSize = 12
+twoLabel.ZIndex = 2
+
+-- Click handler for the switch background (toggle cooldown duration)
+switchBg.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or
+       input.UserInputType == Enum.UserInputType.MouseButton1 then
+        -- Toggle between 1 and 2 seconds
+        if cooldownDuration == 1 then
+            cooldownDuration = 2
+            switchIndicator:TweenPosition(UDim2.new(0.5, 0, 0, 0), "Out", "Quad", 0.2, true)
+        else
+            cooldownDuration = 1
+            switchIndicator:TweenPosition(UDim2.new(0, 0, 0, 0), "Out", "Quad", 0.2, true)
+        end
+        -- Update cooldown label if currently active? Not needed, just new value will be used next flick.
+    end
+end)
+
+-- Cooldown display label (under the switch)
+local cooldownLabel = Instance.new("TextLabel", panel)
+cooldownLabel.Size = UDim2.new(1, -20, 0, 18)
+cooldownLabel.Position = UDim2.new(0, 10, 0, 100)
+cooldownLabel.BackgroundTransparency = 1
+cooldownLabel.Text = ""
+cooldownLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+cooldownLabel.Font = Enum.Font.SourceSans
+cooldownLabel.TextSize = 12
+
+-- ============= COOLDOWN DISPLAY UPDATER =============
+local function startCooldown()
+    cooldownEnd = os.clock() + cooldownDuration
+    cooldownActive = true
+end
+
+runService.Heartbeat:Connect(function()
+    if cooldownActive then
+        local remaining = cooldownEnd - os.clock()
+        if remaining <= 0 then
+            cooldownActive = false
+            cooldownLabel.Text = ""
+        else
+            cooldownLabel.Text = string.format("%.1fs", remaining)
+        end
+    end
+end)
+
+-- ============= FLICK FUNCTION =============
+local function smoothFlick()
+    if not flickEnabled or isFlicking or cooldownActive then return end
+    isFlicking = true
+    startCooldown()
+
+    task.wait(0.075)
+
+    if not flickEnabled then
+        isFlicking = false
+        return
+    end
+
+    local originalPos = cam.CFrame.Position
+    local originalLook = cam.CFrame.LookVector
+
+    local horizontalDir = (originalLook * Vector3.new(1,0,1))
+    if horizontalDir.Magnitude < 1e-5 then
+        horizontalDir = Vector3.new(1,0,0)
+    else
+        horizontalDir = horizontalDir.Unit
+    end
+    local pitchAngle = math.asin(originalLook.Y)
+    local targetHorizontal = -horizontalDir
+
+    local duration = 0.25
+    local elapsed = 0
+
+    flickConn = runService.Heartbeat:Connect(function(deltaTime)
+        elapsed = elapsed + deltaTime
+        local t = math.min(elapsed / duration, 1)
+
+        local angle = math.acos(math.clamp(horizontalDir:Dot(targetHorizontal), -1, 1)) * t
+        local newHorizontal = horizontalDir * math.cos(angle) +
+                              targetHorizontal * math.sin(angle)
+        newHorizontal = newHorizontal.Unit
+
+        local newLook = newHorizontal * math.cos(pitchAngle)
+        newLook = newLook + Vector3.new(0, math.sin(pitchAngle), 0)
+
+        cam.CFrame = CFrame.new(originalPos, originalPos + newLook)
+
+        if t >= 1 then
+            flickConn:Disconnect()
+            flickConn = nil
+            cam.CFrame = CFrame.new(originalPos, originalPos + originalLook)
+            isFlicking = false
+        end
+    end)
+end
+
+-- ============= INPUT DETECTION =============
+local inputCon = nil
+
+local function enableFlick()
+    if inputCon then inputCon:Disconnect() end
+    inputCon = uis.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        local trigger = false
+        if input.UserInputType == Enum.UserInputType.Touch then
+            trigger = true
+        elseif input.KeyCode == Enum.KeyCode.ButtonR2 then
+            trigger = true
+        end
+
+        if trigger and flickEnabled then
+            smoothFlick()
+        end
+    end)
+end
+
+local function disableFlick()
+    if inputCon then inputCon:Disconnect(); inputCon = nil end
+    if flickConn then flickConn:Disconnect(); flickConn = nil end
+    isFlicking = false
+end
+
+-- ============= TOGGLE BUTTON LOGIC =============
+toggleBtn.MouseButton1Click:Connect(function()
+    flickEnabled = not flickEnabled
+    if flickEnabled then
+        toggleBtn.Text = "Flick: ON"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 50)
+        enableFlick()
+    else
+        toggleBtn.Text = "Flick: OFF"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        disableFlick()
+    end
+end)
+
+-- Cleanup on respawn
+player.CharacterAdded:Connect(function()
+    if flickConn then flickConn:Disconnect(); flickConn = nil end
+    isFlicking = false
+end)
+
+-- Set initial switch indicator position (1s by default)
+switchIndicator.Position = UDim2.new(0, 0, 0, 0)
