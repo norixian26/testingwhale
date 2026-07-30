@@ -1,0 +1,579 @@
+-- Delta Executor: Camlock (Toggle with DPad Left) – COMPLETE & FIXED (World‑Space Aim)
+-- All GUI elements included. Works in first & third person.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Cam = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+local function debugPrint(msg)
+    print("[Camlock] " .. tostring(msg))
+end
+
+debugPrint("Script initializing...")
+
+-- Settings
+local Settings = {
+    Enabled = false,
+    LockStrength = 0.3,        -- 0 (slow) to 1 (instant)
+    FOVRadius = 150,           -- pixels, for target selection
+    HitPart = "Head",
+    PredictionTime = 0.12,
+    JitterEnabled = true,
+    JitterStrength = 2,        -- degrees (0‑5)
+    TeamCheck = true,
+    VisibilityCheck = true,
+    ShowFOV = true,
+}
+
+-- Runtime
+local Target = nil
+local FOVCircle = nil
+local JitterAngle = 0   -- current random jitter angle (radians)
+local lastJitterUpdate = 0
+local jitterInterval = 0.1
+
+-- ============= GUI =============
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+ScreenGui.ResetOnSpawn = false
+
+local Panel = Instance.new("Frame")
+Panel.Size = UDim2.new(0, 240, 0, 340)
+Panel.Position = UDim2.new(1, -250, 0.5, -170)
+Panel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+Panel.BorderSizePixel = 0
+Panel.Draggable = true
+Panel.Active = true
+Panel.Visible = true
+Panel.Parent = ScreenGui
+Instance.new("UICorner", Panel).CornerRadius = UDim.new(0, 12)
+
+-- Title
+local Title = Instance.new("TextLabel", Panel)
+Title.Size = UDim2.new(1, 0, 0, 30)
+Title.BackgroundTransparency = 1
+Title.Text = "Camlock"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.Font = Enum.Font.SourceSansBold
+Title.TextSize = 16
+
+-- Toggle Button
+local ToggleBtn = Instance.new("TextButton", Panel)
+ToggleBtn.Size = UDim2.new(1, -20, 0, 36)
+ToggleBtn.Position = UDim2.new(0, 10, 0, 40)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+ToggleBtn.Text = "Camlock: OFF"
+ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleBtn.Font = Enum.Font.SourceSansBold
+ToggleBtn.TextSize = 14
+ToggleBtn.BorderSizePixel = 0
+Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 8)
+
+local function toggleCamlock()
+    Settings.Enabled = not Settings.Enabled
+    if Settings.Enabled then
+        ToggleBtn.Text = "Camlock: ON"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 50)
+        debugPrint("Camlock ENABLED")
+    else
+        ToggleBtn.Text = "Camlock: OFF"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        Target = nil
+        debugPrint("Camlock DISABLED")
+    end
+end
+
+ToggleBtn.MouseButton1Click:Connect(toggleCamlock)
+
+-- DPad Left toggle
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.KeyCode == Enum.KeyCode.DPadLeft then
+        toggleCamlock()
+    end
+end)
+
+-- FOV Slider
+local FOVLabel = Instance.new("TextLabel", Panel)
+FOVLabel.Size = UDim2.new(1, -20, 0, 20)
+FOVLabel.Position = UDim2.new(0, 10, 0, 90)
+FOVLabel.BackgroundTransparency = 1
+FOVLabel.Text = "FOV Radius: " .. Settings.FOVRadius
+FOVLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+FOVLabel.Font = Enum.Font.SourceSans
+FOVLabel.TextSize = 13
+
+local FOVSlider = Instance.new("Frame", Panel)
+FOVSlider.Size = UDim2.new(1, -20, 0, 6)
+FOVSlider.Position = UDim2.new(0, 10, 0, 115)
+FOVSlider.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+FOVSlider.BorderSizePixel = 0
+Instance.new("UICorner", FOVSlider).CornerRadius = UDim.new(0, 3)
+
+local FOVFill = Instance.new("Frame", FOVSlider)
+FOVFill.Size = UDim2.new(Settings.FOVRadius / 300, 0, 1, 0)
+FOVFill.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+FOVFill.BorderSizePixel = 0
+Instance.new("UICorner", FOVFill).CornerRadius = UDim.new(0, 3)
+
+local FOVThumb = Instance.new("TextButton", FOVSlider)
+FOVThumb.Size = UDim2.new(0, 18, 1, 0)
+FOVThumb.Position = UDim2.new(Settings.FOVRadius / 300, -9, 0, 0)
+FOVThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+FOVThumb.Text = ""
+FOVThumb.BorderSizePixel = 0
+Instance.new("UICorner", FOVThumb).CornerRadius = UDim.new(0, 3)
+
+local draggingFOV = false
+FOVThumb.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        draggingFOV = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        draggingFOV = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if draggingFOV and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+        local mousePos = UserInputService:GetMouseLocation()
+        local sliderAbs = FOVSlider.AbsolutePosition
+        local sliderSize = FOVSlider.AbsoluteSize
+        local relX = math.clamp((mousePos.X - sliderAbs.X) / sliderSize.X, 0, 1)
+        Settings.FOVRadius = math.floor(relX * 300)
+        if Settings.FOVRadius < 30 then Settings.FOVRadius = 30 end
+        FOVLabel.Text = "FOV Radius: " .. Settings.FOVRadius
+        FOVFill.Size = UDim2.new(relX, 0, 1, 0)
+        FOVThumb.Position = UDim2.new(relX, -9, 0, 0)
+    end
+end)
+
+-- Lock Strength Slider
+local LockLabel = Instance.new("TextLabel", Panel)
+LockLabel.Size = UDim2.new(1, -20, 0, 20)
+LockLabel.Position = UDim2.new(0, 10, 0, 130)
+LockLabel.BackgroundTransparency = 1
+LockLabel.Text = "Lock Strength: " .. string.format("%.2f", Settings.LockStrength)
+LockLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+LockLabel.Font = Enum.Font.SourceSans
+LockLabel.TextSize = 13
+
+local LockSlider = Instance.new("Frame", Panel)
+LockSlider.Size = UDim2.new(1, -20, 0, 6)
+LockSlider.Position = UDim2.new(0, 10, 0, 155)
+LockSlider.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+LockSlider.BorderSizePixel = 0
+Instance.new("UICorner", LockSlider).CornerRadius = UDim.new(0, 3)
+
+local LockFill = Instance.new("Frame", LockSlider)
+LockFill.Size = UDim2.new(Settings.LockStrength, 0, 1, 0)
+LockFill.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+LockFill.BorderSizePixel = 0
+Instance.new("UICorner", LockFill).CornerRadius = UDim.new(0, 3)
+
+local LockThumb = Instance.new("TextButton", LockSlider)
+LockThumb.Size = UDim2.new(0, 18, 1, 0)
+LockThumb.Position = UDim2.new(Settings.LockStrength, -9, 0, 0)
+LockThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+LockThumb.Text = ""
+LockThumb.BorderSizePixel = 0
+Instance.new("UICorner", LockThumb).CornerRadius = UDim.new(0, 3)
+
+local draggingLock = false
+LockThumb.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        draggingLock = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        draggingLock = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if draggingLock and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+        local mousePos = UserInputService:GetMouseLocation()
+        local sliderAbs = LockSlider.AbsolutePosition
+        local sliderSize = LockSlider.AbsoluteSize
+        local relX = math.clamp((mousePos.X - sliderAbs.X) / sliderSize.X, 0, 1)
+        Settings.LockStrength = relX
+        LockLabel.Text = "Lock Strength: " .. string.format("%.2f", relX)
+        LockFill.Size = UDim2.new(relX, 0, 1, 0)
+        LockThumb.Position = UDim2.new(relX, -9, 0, 0)
+    end
+end)
+
+-- Prediction Slider
+local PredLabel = Instance.new("TextLabel", Panel)
+PredLabel.Size = UDim2.new(1, -20, 0, 20)
+PredLabel.Position = UDim2.new(0, 10, 0, 170)
+PredLabel.BackgroundTransparency = 1
+PredLabel.Text = "Prediction: " .. Settings.PredictionTime .. "s"
+PredLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+PredLabel.Font = Enum.Font.SourceSans
+PredLabel.TextSize = 13
+
+local PredSlider = Instance.new("Frame", Panel)
+PredSlider.Size = UDim2.new(1, -20, 0, 6)
+PredSlider.Position = UDim2.new(0, 10, 0, 195)
+PredSlider.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+PredSlider.BorderSizePixel = 0
+Instance.new("UICorner", PredSlider).CornerRadius = UDim.new(0, 3)
+
+local PredFill = Instance.new("Frame", PredSlider)
+PredFill.Size = UDim2.new(Settings.PredictionTime / 0.5, 0, 1, 0)
+PredFill.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+PredFill.BorderSizePixel = 0
+Instance.new("UICorner", PredFill).CornerRadius = UDim.new(0, 3)
+
+local PredThumb = Instance.new("TextButton", PredSlider)
+PredThumb.Size = UDim2.new(0, 18, 1, 0)
+PredThumb.Position = UDim2.new(Settings.PredictionTime / 0.5, -9, 0, 0)
+PredThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+PredThumb.Text = ""
+PredThumb.BorderSizePixel = 0
+Instance.new("UICorner", PredThumb).CornerRadius = UDim.new(0, 3)
+
+local draggingPred = false
+PredThumb.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        draggingPred = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        draggingPred = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if draggingPred and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+        local mousePos = UserInputService:GetMouseLocation()
+        local sliderAbs = PredSlider.AbsolutePosition
+        local sliderSize = PredSlider.AbsoluteSize
+        local relX = math.clamp((mousePos.X - sliderAbs.X) / sliderSize.X, 0, 1)
+        Settings.PredictionTime = relX * 0.5
+        PredLabel.Text = "Prediction: " .. string.format("%.2f", Settings.PredictionTime) .. "s"
+        PredFill.Size = UDim2.new(relX, 0, 1, 0)
+        PredThumb.Position = UDim2.new(relX, -9, 0, 0)
+    end
+end)
+
+-- Hit Part Dropdown
+local HitPartLabel = Instance.new("TextLabel", Panel)
+HitPartLabel.Size = UDim2.new(0, 80, 0, 20)
+HitPartLabel.Position = UDim2.new(0, 10, 0, 210)
+HitPartLabel.BackgroundTransparency = 1
+HitPartLabel.Text = "Hit Part:"
+HitPartLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+HitPartLabel.Font = Enum.Font.SourceSans
+HitPartLabel.TextSize = 13
+
+local HitPartDropdown = Instance.new("TextButton", Panel)
+HitPartDropdown.Size = UDim2.new(0, 80, 0, 24)
+HitPartDropdown.Position = UDim2.new(0, 90, 0, 208)
+HitPartDropdown.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+HitPartDropdown.Text = Settings.HitPart
+HitPartDropdown.TextColor3 = Color3.fromRGB(255, 255, 255)
+HitPartDropdown.Font = Enum.Font.SourceSans
+HitPartDropdown.TextSize = 13
+HitPartDropdown.BorderSizePixel = 0
+Instance.new("UICorner", HitPartDropdown).CornerRadius = UDim.new(0, 6)
+
+local HitPartsList = {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso"}
+local dropdownOpen = false
+local dropdownFrame = Instance.new("Frame", Panel)
+dropdownFrame.Size = UDim2.new(0, 80, 0, 0)
+dropdownFrame.Position = UDim2.new(0, 90, 0, 232)
+dropdownFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+dropdownFrame.BorderSizePixel = 0
+dropdownFrame.Visible = false
+Instance.new("UICorner", dropdownFrame).CornerRadius = UDim.new(0, 6)
+
+HitPartDropdown.MouseButton1Click:Connect(function()
+    dropdownOpen = not dropdownOpen
+    dropdownFrame.Visible = dropdownOpen
+    if dropdownOpen then
+        dropdownFrame.Size = UDim2.new(0, 80, 0, #HitPartsList * 22)
+    end
+end)
+
+for i, partName in ipairs(HitPartsList) do
+    local option = Instance.new("TextButton", dropdownFrame)
+    option.Size = UDim2.new(1, 0, 0, 20)
+    option.Position = UDim2.new(0, 0, 0, (i-1)*22)
+    option.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    option.Text = partName
+    option.TextColor3 = Color3.fromRGB(255, 255, 255)
+    option.Font = Enum.Font.SourceSans
+    option.TextSize = 12
+    option.BorderSizePixel = 0
+    option.MouseButton1Click:Connect(function()
+        Settings.HitPart = partName
+        HitPartDropdown.Text = partName
+        dropdownOpen = false
+        dropdownFrame.Visible = false
+        debugPrint("Hit part set to: " .. partName)
+    end)
+end
+
+-- Jitter Toggle & Strength (now degrees)
+local JitterToggle = Instance.new("TextButton", Panel)
+JitterToggle.Size = UDim2.new(0, 90, 0, 28)
+JitterToggle.Position = UDim2.new(0, 10, 0, 245)
+JitterToggle.BackgroundColor3 = Settings.JitterEnabled and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+JitterToggle.Text = "Jitter: " .. (Settings.JitterEnabled and "ON" or "OFF")
+JitterToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+JitterToggle.Font = Enum.Font.SourceSansBold
+JitterToggle.TextSize = 13
+JitterToggle.BorderSizePixel = 0
+Instance.new("UICorner", JitterToggle).CornerRadius = UDim.new(0, 8)
+JitterToggle.MouseButton1Click:Connect(function()
+    Settings.JitterEnabled = not Settings.JitterEnabled
+    JitterToggle.BackgroundColor3 = Settings.JitterEnabled and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+    JitterToggle.Text = "Jitter: " .. (Settings.JitterEnabled and "ON" or "OFF")
+    debugPrint("Jitter " .. (Settings.JitterEnabled and "ON" or "OFF"))
+end)
+
+local JitterLabel = Instance.new("TextLabel", Panel)
+JitterLabel.Size = UDim2.new(0, 80, 0, 20)
+JitterLabel.Position = UDim2.new(0, 110, 0, 250)
+JitterLabel.BackgroundTransparency = 1
+JitterLabel.Text = "Deg: " .. Settings.JitterStrength .. "°"
+JitterLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+JitterLabel.Font = Enum.Font.SourceSans
+JitterLabel.TextSize = 12
+
+local JitterPlus = Instance.new("TextButton", Panel)
+JitterPlus.Size = UDim2.new(0, 24, 0, 20)
+JitterPlus.Position = UDim2.new(0, 180, 0, 250)
+JitterPlus.BackgroundColor3 = Color3.fromRGB(0, 120, 0)
+JitterPlus.Text = "+"
+JitterPlus.TextColor3 = Color3.fromRGB(255, 255, 255)
+JitterPlus.Font = Enum.Font.SourceSansBold
+JitterPlus.BorderSizePixel = 0
+Instance.new("UICorner", JitterPlus).CornerRadius = UDim.new(0, 6)
+JitterPlus.MouseButton1Click:Connect(function()
+    Settings.JitterStrength = math.min(5, Settings.JitterStrength + 0.5)
+    JitterLabel.Text = "Deg: " .. string.format("%.1f", Settings.JitterStrength) .. "°"
+    debugPrint("Jitter strength: " .. Settings.JitterStrength .. "°")
+end)
+
+local JitterMinus = Instance.new("TextButton", Panel)
+JitterMinus.Size = UDim2.new(0, 24, 0, 20)
+JitterMinus.Position = UDim2.new(0, 205, 0, 250)
+JitterMinus.BackgroundColor3 = Color3.fromRGB(120, 0, 0)
+JitterMinus.Text = "-"
+JitterMinus.TextColor3 = Color3.fromRGB(255, 255, 255)
+JitterMinus.Font = Enum.Font.SourceSansBold
+JitterMinus.BorderSizePixel = 0
+Instance.new("UICorner", JitterMinus).CornerRadius = UDim.new(0, 6)
+JitterMinus.MouseButton1Click:Connect(function()
+    Settings.JitterStrength = math.max(0, Settings.JitterStrength - 0.5)
+    JitterLabel.Text = "Deg: " .. string.format("%.1f", Settings.JitterStrength) .. "°"
+    debugPrint("Jitter strength: " .. Settings.JitterStrength .. "°")
+end)
+
+-- Team Check Toggle
+local TeamCheckToggle = Instance.new("TextButton", Panel)
+TeamCheckToggle.Size = UDim2.new(0, 110, 0, 28)
+TeamCheckToggle.Position = UDim2.new(0, 10, 0, 280)
+TeamCheckToggle.BackgroundColor3 = Settings.TeamCheck and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+TeamCheckToggle.Text = "Team Check: " .. (Settings.TeamCheck and "ON" or "OFF")
+TeamCheckToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+TeamCheckToggle.Font = Enum.Font.SourceSansBold
+TeamCheckToggle.TextSize = 12
+TeamCheckToggle.BorderSizePixel = 0
+Instance.new("UICorner", TeamCheckToggle).CornerRadius = UDim.new(0, 8)
+TeamCheckToggle.MouseButton1Click:Connect(function()
+    Settings.TeamCheck = not Settings.TeamCheck
+    TeamCheckToggle.BackgroundColor3 = Settings.TeamCheck and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+    TeamCheckToggle.Text = "Team Check: " .. (Settings.TeamCheck and "ON" or "OFF")
+    debugPrint("Team check " .. (Settings.TeamCheck and "ON" or "OFF"))
+end)
+
+-- Visibility Check Toggle
+local VisCheckToggle = Instance.new("TextButton", Panel)
+VisCheckToggle.Size = UDim2.new(0, 120, 0, 28)
+VisCheckToggle.Position = UDim2.new(0, 120, 0, 280)
+VisCheckToggle.BackgroundColor3 = Settings.VisibilityCheck and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+VisCheckToggle.Text = "Vis Check: " .. (Settings.VisibilityCheck and "ON" or "OFF")
+VisCheckToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+VisCheckToggle.Font = Enum.Font.SourceSansBold
+VisCheckToggle.TextSize = 12
+VisCheckToggle.BorderSizePixel = 0
+Instance.new("UICorner", VisCheckToggle).CornerRadius = UDim.new(0, 8)
+VisCheckToggle.MouseButton1Click:Connect(function()
+    Settings.VisibilityCheck = not Settings.VisibilityCheck
+    VisCheckToggle.BackgroundColor3 = Settings.VisibilityCheck and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+    VisCheckToggle.Text = "Vis Check: " .. (Settings.VisibilityCheck and "ON" or "OFF")
+    debugPrint("Visibility check " .. (Settings.VisibilityCheck and "ON" or "OFF"))
+end)
+
+-- Show FOV Toggle
+local ShowFOVToggle = Instance.new("TextButton", Panel)
+ShowFOVToggle.Size = UDim2.new(0, 100, 0, 28)
+ShowFOVToggle.Position = UDim2.new(0, 70, 0, 312)
+ShowFOVToggle.BackgroundColor3 = Settings.ShowFOV and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+ShowFOVToggle.Text = "Show FOV"
+ShowFOVToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+ShowFOVToggle.Font = Enum.Font.SourceSansBold
+ShowFOVToggle.TextSize = 12
+ShowFOVToggle.BorderSizePixel = 0
+Instance.new("UICorner", ShowFOVToggle).CornerRadius = UDim.new(0, 8)
+ShowFOVToggle.MouseButton1Click:Connect(function()
+    Settings.ShowFOV = not Settings.ShowFOV
+    ShowFOVToggle.BackgroundColor3 = Settings.ShowFOV and Color3.fromRGB(0, 150, 50) or Color3.fromRGB(50, 50, 50)
+    if FOVCircle then
+        FOVCircle.Visible = Settings.ShowFOV
+    end
+    debugPrint("Show FOV " .. (Settings.ShowFOV and "ON" or "OFF"))
+end)
+
+-- FOV Circle Drawing
+FOVCircle = Drawing.new("Circle")
+FOVCircle.Visible = Settings.ShowFOV
+FOVCircle.Radius = Settings.FOVRadius
+FOVCircle.Thickness = 2
+FOVCircle.Color = Color3.fromRGB(255, 255, 255)
+FOVCircle.Transparency = 0.8
+FOVCircle.Filled = false
+FOVCircle.Position = Vector2.new(Cam.ViewportSize.X/2, Cam.ViewportSize.Y/2)
+
+RunService.Heartbeat:Connect(function()
+    if FOVCircle then
+        FOVCircle.Position = Vector2.new(Cam.ViewportSize.X/2, Cam.ViewportSize.Y/2)
+        FOVCircle.Radius = Settings.FOVRadius
+    end
+end)
+
+-- ============= CORE LOGIC =============
+local function isAlive(player)
+    if not player.Character then return false end
+    local hum = player.Character:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function isTeammate(player)
+    if not Settings.TeamCheck then return false end
+    if player.Team and LocalPlayer.Team then
+        return player.Team == LocalPlayer.Team
+    end
+    return false
+end
+
+local function getHitPart(character)
+    local part = character:FindFirstChild(Settings.HitPart)
+    if not part then
+        part = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+        debugPrint("Fallback hit part: " .. (part and part.Name or "none"))
+    end
+    return part
+end
+
+local function isVisible(targetPart)
+    if not targetPart then return false end
+    local origin = Cam.CFrame.Position
+    local direction = (targetPart.Position - origin).Unit
+    local distance = (targetPart.Position - origin).Magnitude - 0.1
+    if distance <= 0 then return true end
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    rayParams.FilterDescendantsInstances = {LocalPlayer.Character, targetPart.Parent}
+    local result = workspace:Raycast(origin, direction * distance, rayParams)
+    return result == nil
+end
+
+local function getClosestEnemyInFOV()
+    local screenCenter = Vector2.new(Cam.ViewportSize.X/2, Cam.ViewportSize.Y/2)
+    local closestDist = Settings.FOVRadius
+    local closestEnemy = nil
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and isAlive(player) and not isTeammate(player) then
+            local targetPart = getHitPart(player.Character)
+            if targetPart then
+                local screenPos, onScreen = Cam:WorldToScreenPoint(targetPart.Position)
+                if onScreen then
+                    local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                    if screenDist <= closestDist then
+                        if Settings.VisibilityCheck and not isVisible(targetPart) then
+                            -- skip
+                        else
+                            closestDist = screenDist
+                            closestEnemy = {Player = player, Part = targetPart}
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closestEnemy
+end
+
+local function updateJitter()
+    if Settings.JitterEnabled and Settings.JitterStrength > 0 then
+        local deg = (math.random() - 0.5) * 2 * Settings.JitterStrength
+        JitterAngle = math.rad(deg)
+    else
+        JitterAngle = 0
+    end
+end
+
+-- Main camlock loop (pure world‑space aim)
+RunService.Heartbeat:Connect(function(deltaTime)
+    lastJitterUpdate = lastJitterUpdate + deltaTime
+    if lastJitterUpdate >= jitterInterval then
+        updateJitter()
+        lastJitterUpdate = 0
+    end
+
+    if not Settings.Enabled then
+        Target = nil
+        return
+    end
+
+    local enemy = getClosestEnemyInFOV()
+    if enemy then
+        if Target and Target.Player ~= enemy.Player then
+            debugPrint("New target locked: " .. enemy.Player.Name .. " (" .. Settings.HitPart .. ")")
+        elseif not Target then
+            debugPrint("Target acquired: " .. enemy.Player.Name)
+        end
+        Target = enemy
+    else
+        if Target then
+            debugPrint("Target lost (none in FOV)")
+        end
+        Target = nil
+        return
+    end
+
+    -- Predict position
+    local targetPos = Target.Part.Position
+    local targetVelocity = Target.Part.Velocity or Vector3.zero
+    targetPos = targetPos + targetVelocity * Settings.PredictionTime
+
+    -- Direction from camera to predicted target
+    local desiredLook = (targetPos - Cam.CFrame.Position).Unit
+
+    -- Apply angular jitter
+    if JitterAngle ~= 0 then
+        local axis = Vector3.new(0, 1, 0)  -- world up
+        local rotation = CFrame.fromAxisAngle(axis, JitterAngle)
+        desiredLook = rotation * desiredLook
+    end
+
+    -- Smoothly move camera
+    local currentLook = Cam.CFrame.LookVector
+    local newLook = currentLook:Lerp(desiredLook, Settings.LockStrength).Unit
+    Cam.CFrame = CFrame.new(Cam.CFrame.Position, Cam.CFrame.Position + newLook)
+end)
+
+LocalPlayer.CharacterAdded:Connect(function(character)
+    debugPrint("Character respawned; resetting lock")
+    Target = nil
+end)
+
+debugPrint("Camlock toggle ready — press DPad Left to enable/disable.")
